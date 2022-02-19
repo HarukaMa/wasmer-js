@@ -1,7 +1,11 @@
+use std::cell::RefCell;
 use crate::fs::MemFS;
 use std::io::{Read, Write};
+use std::rc::Rc;
+use js_sys::Promise;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::future_to_promise;
 use wasmer::{
     ChainableNamedResolver, ImportObject, Instance, JsImportObject, Module, NamedResolverChain,
 };
@@ -15,8 +19,8 @@ struct InstantiatedWASI {
 
 #[wasm_bindgen]
 pub struct WASI {
-    wasi_env: WasiEnv,
-    instantiated: Option<InstantiatedWASI>,
+    wasi_env: Rc<RefCell<WasiEnv>>,
+    instantiated: Rc<RefCell<Option<InstantiatedWASI>>>,
 }
 
 #[wasm_bindgen]
@@ -105,14 +109,15 @@ impl WASI {
             .map_err(|e| js_sys::Error::new(&format!("Failed to create the WasiState: {}`", e)))?;
 
         Ok(WASI {
-            wasi_env,
-            instantiated: None,
+            wasi_env: Rc::new(RefCell::new(wasi_env)),
+            instantiated: Rc::new(RefCell::new(None)),
         })
     }
 
     #[wasm_bindgen(getter)]
     pub fn fs(&self) -> Result<MemFS, JsValue> {
-        let mut state = self.wasi_env.state();
+        let wasi_env = self.wasi_env.borrow();
+        let mut state = wasi_env.state();
         let mem_fs = state
             .fs
             .fs_backing
@@ -121,36 +126,41 @@ impl WASI {
         Ok(mem_fs.clone())
     }
 
-    pub fn instantiate(&mut self, module: JsValue, imports: js_sys::Object) -> Result<js_sys::WebAssembly::Instance, JsValue> {
-        let module: js_sys::WebAssembly::Module = module.dyn_into().map_err(|_e| {
-            js_sys::Error::new(
-                "You must provide a module to the WASI new. `let module = new WASI({}, module);`",
-            )
-        })?;
-        let module: Module = module.into();
-        let import_object = self.wasi_env.import_object(&module).map_err(|e| {
-            js_sys::Error::new(&format!("Failed to create the Import Object: {}`", e))
-        })?;
+    pub fn instantiate(&mut self, module: JsValue, imports: js_sys::Object) -> Promise {
+        let wasi_env = self.wasi_env.clone();
+        let instantiated = self.instantiated.clone();
+        future_to_promise(async move {
+            let mut wasi_env = wasi_env.borrow_mut();
+            let mut instantiated = instantiated.borrow_mut();
+            let module: js_sys::WebAssembly::Module = module.dyn_into().map_err(|_e| {
+                js_sys::Error::new(
+                    "You must provide a module to the WASI new. `let module = new WASI({}, module);`",
+                )
+            })?;
+            let module: Module = module.into();
+            let import_object = wasi_env.import_object(&module).map_err(|e| {
+                js_sys::Error::new(&format!("Failed to create the Import Object: {}`", e))
+            })?;
 
-        let resolver = JsImportObject::new(&module, imports);
-        let resolver = resolver.chain_front(import_object);
+            let resolver = JsImportObject::new(&module, imports);
+            let resolver = resolver.chain_front(import_object);
 
-        let instance = Instance::new(&module, &resolver)
-            .map_err(|e| js_sys::Error::new(&format!("Failed to instantiate WASI: {}`", e)))?;
-        
-        let raw_instance = instance.raw().clone();
-        self.instantiated = Some(InstantiatedWASI { resolver, instance });
+            let instance = Instance::new(&module, &resolver).await
+                .map_err(|e| js_sys::Error::new(&format!("Failed to instantiate WASI: {}`", e)))?;
 
-        Ok(raw_instance)
+            let raw_instance = instance.raw().clone();
+            instantiated.replace(InstantiatedWASI { resolver, instance });
+
+            Ok(raw_instance.dyn_into().unwrap())
+        })
     }
 
     /// Start the WASI Instance, it returns the status code when calling the start
     /// function
     pub fn start(&self) -> Result<u32, JsValue> {
-        let start = self
-            .instantiated
-            .as_ref()
-            .unwrap()
+        let cell = self.instantiated.borrow();
+        let instantiated = cell.as_ref().unwrap();
+        let start = instantiated
             .instance
             .exports
             .get_function("_start")
@@ -190,7 +200,8 @@ impl WASI {
     /// Note: this method flushes the stdout
     #[wasm_bindgen(js_name = getStdoutBuffer)]
     pub fn get_stdout_buffer(&self) -> Result<Vec<u8>, JsValue> {
-        let mut state = self.wasi_env.state();
+        let wasi_env = self.wasi_env.borrow();
+        let mut state = wasi_env.state();
         let stdout = state.fs.stdout_mut().unwrap().as_mut().unwrap();
         let stdout = stdout.downcast_mut::<Stdout>().unwrap();
         let buf = stdout.buf.clone();
@@ -219,7 +230,8 @@ impl WASI {
     /// Note: this method flushes the stderr
     #[wasm_bindgen(js_name = getStderrBuffer)]
     pub fn get_stderr_buffer(&self) -> Result<Vec<u8>, JsValue> {
-        let mut state = self.wasi_env.state();
+        let wasi_env = self.wasi_env.borrow();
+        let mut state = wasi_env.state();
         let stderr = state.fs.stderr_mut().unwrap().as_mut().unwrap();
         let stderr = stderr.downcast_mut::<Stderr>().unwrap();
         let buf = stderr.buf.clone();
@@ -247,7 +259,8 @@ impl WASI {
     /// Set the stdin buffer
     #[wasm_bindgen(js_name = setStdinBuffer)]
     pub fn set_stdin_buffer(&self, mut buf: Vec<u8>) -> Result<(), JsValue> {
-        let mut state = self.wasi_env.state();
+        let wasi_env = self.wasi_env.borrow();
+        let mut state = wasi_env.state();
         let stdin = state.fs.stdin_mut().unwrap().as_mut().unwrap();
         let stdin = stdin.downcast_mut::<Stdin>().unwrap();
         stdin.buf.append(&mut buf);
